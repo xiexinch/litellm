@@ -16,14 +16,14 @@ from litellm.types.utils import Delta, ModelResponse, StreamingChoices
 
 def test_anthropic_experimental_pass_through_messages_handler():
     """
-    Test that api key is passed to litellm.responses for OpenAI models.
-    OpenAI and Azure models are routed directly to the Responses API.
+    Test that api key is passed to litellm.completion for OpenAI models.
+    All non-native models are routed through chat/completions.
     """
     from litellm.llms.anthropic.experimental_pass_through.messages.handler import (
         anthropic_messages_handler,
     )
 
-    with patch("litellm.responses", return_value="test-response") as mock_responses:
+    with patch("litellm.completion", return_value=MagicMock()) as mock_completion:
         try:
             anthropic_messages_handler(
                 max_tokens=100,
@@ -33,8 +33,8 @@ def test_anthropic_experimental_pass_through_messages_handler():
             )
         except (ValueError, TypeError, AttributeError) as e:
             print(f"Error: {e}")
-        mock_responses.assert_called_once()
-        assert mock_responses.call_args.kwargs["api_key"] == "test-api-key"
+        mock_completion.assert_called_once()
+        assert mock_completion.call_args.kwargs["api_key"] == "test-api-key"
 
 
 def test_anthropic_experimental_pass_through_messages_handler_dynamic_api_key_and_api_base_and_custom_values():
@@ -153,16 +153,15 @@ async def test_bedrock_converse_budget_tokens_preserved():
 def test_openai_model_with_thinking_converts_to_reasoning():
     """
     Test that when using an OpenAI model with thinking parameter, the thinking is
-    converted to a Responses API `reasoning` param (NOT passed as thinking).
+    converted to reasoning_effort for the chat completions endpoint.
 
-    OpenAI models are routed directly to the Responses API, so we verify that
-    litellm.responses() is called with `reasoning` properly set.
+    OpenAI models now route through chat/completions (not Responses API).
     """
     from litellm.llms.anthropic.experimental_pass_through.messages.handler import (
         anthropic_messages_handler,
     )
 
-    with patch("litellm.responses", return_value="test-response") as mock_responses:
+    with patch("litellm.completion", return_value=MagicMock()) as mock_completion:
         try:
             anthropic_messages_handler(
                 max_tokens=1024,
@@ -174,28 +173,31 @@ def test_openai_model_with_thinking_converts_to_reasoning():
         except (ValueError, TypeError, AttributeError) as e:
             print(f"Error: {e}")
 
-        mock_responses.assert_called_once()
+        mock_completion.assert_called_once()
 
-        call_kwargs = mock_responses.call_args.kwargs
+        call_kwargs = mock_completion.call_args.kwargs
 
-        # Verify reasoning is set (converted from thinking)
+        # Verify reasoning_effort is set (converted from thinking)
         assert (
-            "reasoning" in call_kwargs
-        ), "reasoning should be passed to litellm.responses"
+            "reasoning_effort" in call_kwargs
+        ), "reasoning_effort should be passed to litellm.completion"
 
         # budget_tokens=1024 -> effort="minimal" (< 2000 threshold)
         # reasoning_auto_summary is False by default, so no summary key
-        expected_reasoning = {"effort": "minimal"}
-        assert call_kwargs["reasoning"] == expected_reasoning, (
-            f"reasoning should be {expected_reasoning} for budget_tokens=1024, "
-            f"got {call_kwargs.get('reasoning')}"
+        assert call_kwargs["reasoning_effort"] == "minimal", (
+            f"reasoning_effort should be 'minimal' for budget_tokens=1024, "
+            f"got {call_kwargs.get('reasoning_effort')}"
         )
-        assert "summary" not in call_kwargs["reasoning"]
 
-        # Verify thinking is NOT passed directly to the Responses API
+        # Verify thinking is NOT passed directly
         assert (
             "thinking" not in call_kwargs
-        ), "thinking should NOT be passed directly to litellm.responses"
+        ), "thinking should NOT be passed directly to litellm.completion"
+
+        # Verify model is NOT prefixed with responses/
+        assert not call_kwargs["model"].startswith(
+            "responses/"
+        ), f"model should NOT have responses/ prefix, got {call_kwargs['model']}"
 
 
 class TestThinkingParameterTransformation:
@@ -424,12 +426,12 @@ class TestThinkingSummaryPreservation:
             litellm.reasoning_auto_summary = original
 
     def test_openai_model_with_thinking_summary_end_to_end(self):
-        """End-to-end: anthropic_messages_handler should preserve thinking.summary for OpenAI models."""
+        """End-to-end: anthropic_messages_handler should preserve thinking.summary for OpenAI models via chat completions."""
         from litellm.llms.anthropic.experimental_pass_through.messages.handler import (
             anthropic_messages_handler,
         )
 
-        with patch("litellm.responses", return_value="test-response") as mock_responses:
+        with patch("litellm.completion", return_value=MagicMock()) as mock_completion:
             try:
                 anthropic_messages_handler(
                     max_tokens=1024,
@@ -445,12 +447,15 @@ class TestThinkingSummaryPreservation:
             except (ValueError, TypeError, AttributeError):
                 pass
 
-            mock_responses.assert_called_once()
-            call_kwargs = mock_responses.call_args.kwargs
-            reasoning = call_kwargs["reasoning"]
+            mock_completion.assert_called_once()
+            call_kwargs = mock_completion.call_args.kwargs
+            reasoning_effort = call_kwargs["reasoning_effort"]
+            assert isinstance(
+                reasoning_effort, dict
+            ), f"Expected reasoning_effort to be a dict, got {type(reasoning_effort)}"
             assert (
-                reasoning["summary"] == "concise"
-            ), f"Expected summary='concise', got summary='{reasoning.get('summary')}'"
+                reasoning_effort["summary"] == "concise"
+            ), f"Expected summary='concise', got summary='{reasoning_effort.get('summary')}'"
 
     def test_responses_adapter_preserves_summary(self):
         """translate_thinking_to_reasoning should include summary when user provides it."""
