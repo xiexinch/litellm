@@ -6,7 +6,7 @@ in ``adapters.transformation`` so that the chat-completions path has a
 stable, self-contained interface symmetric with ``responses_adapters``.
 """
 
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 from litellm.types.llms.anthropic import AnthropicMessagesRequest
 from litellm.types.llms.anthropic_messages.anthropic_response import (
@@ -63,8 +63,21 @@ class LiteLLMAnthropicToOpenAIChatAdapter:
         model: str,
         tool_name_mapping: Optional[Dict[str, str]] = None,
     ) -> Union[AsyncIterator[bytes], None]:
-        """Wrap an OpenAI streaming response as Anthropic SSE events."""
+        """Wrap an OpenAI async streaming response as Anthropic SSE events."""
         return _ADAPTER.translate_completion_output_params_streaming(
+            completion_stream,
+            model=model,
+            tool_name_mapping=tool_name_mapping,
+        )
+
+    @staticmethod
+    def translate_sync_streaming_response(
+        completion_stream: Any,
+        model: str,
+        tool_name_mapping: Optional[Dict[str, str]] = None,
+    ) -> Iterator[bytes]:
+        """Wrap an OpenAI sync streaming response as Anthropic SSE events."""
+        return _ADAPTER.translate_completion_output_params_sync_streaming(
             completion_stream,
             model=model,
             tool_name_mapping=tool_name_mapping,

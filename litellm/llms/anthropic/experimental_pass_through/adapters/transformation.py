@@ -6,6 +6,7 @@ from typing import (
     Any,
     AsyncIterator,
     Dict,
+    Iterator,
     List,
     Literal,
     Optional,
@@ -214,10 +215,10 @@ class AnthropicAdapter:
         tool_name_mapping: Optional[Dict[str, str]] = None,
     ) -> Union[AsyncIterator[bytes], None]:
         """
-        Translate OpenAI streaming response to Anthropic format.
+        Translate OpenAI streaming response to Anthropic format (async).
 
         Args:
-            completion_stream: The OpenAI streaming response
+            completion_stream: The OpenAI async streaming response
             model: The model name
             tool_name_mapping: Optional mapping of truncated tool names to original names.
         """
@@ -228,6 +229,27 @@ class AnthropicAdapter:
         )
         # Return the SSE-wrapped version for proper event formatting
         return anthropic_wrapper.async_anthropic_sse_wrapper()
+
+    def translate_completion_output_params_sync_streaming(
+        self,
+        completion_stream: Any,
+        model: str,
+        tool_name_mapping: Optional[Dict[str, str]] = None,
+    ) -> Iterator[bytes]:
+        """
+        Translate OpenAI streaming response to Anthropic format (sync).
+
+        Args:
+            completion_stream: The OpenAI sync streaming response
+            model: The model name
+            tool_name_mapping: Optional mapping of truncated tool names to original names.
+        """
+        anthropic_wrapper = AnthropicStreamWrapper(
+            completion_stream=completion_stream,
+            model=model,
+            tool_name_mapping=tool_name_mapping,
+        )
+        return anthropic_wrapper.anthropic_sse_wrapper()
 
 
 class LiteLLMAnthropicMessagesAdapter:

@@ -16,6 +16,7 @@ from typing import (
     AsyncIterator,
     Coroutine,
     Dict,
+    Iterator,
     List,
     Optional,
     Tuple,
@@ -259,14 +260,12 @@ class LiteLLMMessagesToChatCompletionHandler:
         completion_response = litellm.completion(**completion_kwargs)
 
         if stream:
-            transformed_stream = _ADAPTER.translate_streaming_response(
+            transformed_stream = _ADAPTER.translate_sync_streaming_response(
                 completion_response,
                 model=model,
                 tool_name_mapping=tool_name_mapping,
             )
-            if transformed_stream is not None:
-                return transformed_stream
-            raise ValueError("Failed to transform streaming response")
+            return transformed_stream
 
         anthropic_response = _ADAPTER.translate_response(
             cast(ModelResponse, completion_response),

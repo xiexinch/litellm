@@ -54,6 +54,23 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         # Mapping of truncated tool names to original names (for OpenAI's 64-char limit)
         self.tool_name_mapping = tool_name_mapping or {}
 
+    @staticmethod
+    def _has_meaningful_delta_content(processed_chunk: Dict) -> bool:
+        """Return True if a content_block_delta carries non-empty content."""
+        if processed_chunk.get("type") != "content_block_delta":
+            return True
+        delta = processed_chunk.get("delta", {})
+        delta_type = delta.get("type", "")
+        if delta_type == "text_delta":
+            return bool(delta.get("text"))
+        elif delta_type == "input_json_delta":
+            return bool(delta.get("partial_json"))
+        elif delta_type == "thinking_delta":
+            return bool(delta.get("thinking"))
+        elif delta_type == "signature_delta":
+            return bool(delta.get("signature"))
+        return True
+
     def _create_initial_usage_delta(self) -> UsageDelta:
         """
         Create the initial UsageDelta for the message_start event.
@@ -127,53 +144,118 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                     current_content_block_index=self.current_content_block_index,
                 )
 
-                if should_start_new_block and not self.sent_content_block_finish:
-                    # Queue the sequence: content_block_stop -> content_block_start
-                    # The trigger chunk itself is not emitted as a delta since the
-                    # content_block_start already carries the relevant information.
-                    self.chunk_queue.append(
-                        {
-                            "type": "content_block_stop",
-                            "index": max(self.current_content_block_index - 1, 0),
-                        }
-                    )
-                    self.chunk_queue.append(
-                        {
-                            "type": "content_block_start",
-                            "index": self.current_content_block_index,
-                            "content_block": self.current_content_block_start,
-                        }
-                    )
-                    self.sent_content_block_finish = False
+                # Check if this is a usage chunk and we have a held stop_reason chunk
+                if (
+                    self.holding_stop_reason_chunk is not None
+                    and getattr(chunk, "usage", None) is not None
+                ):
+                    # Merge usage into the held stop_reason chunk
+                    merged_chunk = self.holding_stop_reason_chunk.copy()
+                    if "delta" not in merged_chunk:
+                        merged_chunk["delta"] = {}
+
+                    # Add usage to the held chunk
+                    uncached_input_tokens = chunk.usage.prompt_tokens or 0
+                    if (
+                        hasattr(chunk.usage, "prompt_tokens_details")
+                        and chunk.usage.prompt_tokens_details
+                    ):
+                        cached_tokens = (
+                            getattr(
+                                chunk.usage.prompt_tokens_details, "cached_tokens", 0
+                            )
+                            or 0
+                        )
+                        uncached_input_tokens -= cached_tokens
+
+                    usage_dict: UsageDelta = {
+                        "input_tokens": uncached_input_tokens,
+                        "output_tokens": chunk.usage.completion_tokens or 0,
+                    }
+                    # Add cache tokens if available (for prompt caching support)
+                    if (
+                        hasattr(chunk.usage, "_cache_creation_input_tokens")
+                        and chunk.usage._cache_creation_input_tokens > 0
+                    ):
+                        usage_dict[
+                            "cache_creation_input_tokens"
+                        ] = chunk.usage._cache_creation_input_tokens
+                    if (
+                        hasattr(chunk.usage, "_cache_read_input_tokens")
+                        and chunk.usage._cache_read_input_tokens > 0
+                    ):
+                        usage_dict[
+                            "cache_read_input_tokens"
+                        ] = chunk.usage._cache_read_input_tokens
+                    merged_chunk["usage"] = usage_dict
+
+                    # Queue the merged chunk and reset
+                    self.chunk_queue.append(merged_chunk)
+                    self.queued_usage_chunk = True
+                    self.holding_stop_reason_chunk = None
                     return self.chunk_queue.popleft()
 
-                if (
-                    processed_chunk["type"] == "message_delta"
-                    and self.sent_content_block_finish is False
-                ):
-                    # Queue both the content_block_stop and the message_delta
-                    self.chunk_queue.append(
-                        {
-                            "type": "content_block_stop",
-                            "index": self.current_content_block_index,
-                        }
-                    )
-                    self.sent_content_block_finish = True
-                    self.chunk_queue.append(processed_chunk)
-                    return self.chunk_queue.popleft()
-                elif self.holding_chunk is not None:
-                    self.chunk_queue.append(self.holding_chunk)
-                    self.chunk_queue.append(processed_chunk)
-                    self.holding_chunk = None
-                    return self.chunk_queue.popleft()
-                else:
-                    self.chunk_queue.append(processed_chunk)
-                    return self.chunk_queue.popleft()
+                if not self.queued_usage_chunk:
+                    if should_start_new_block and not self.sent_content_block_finish:
+                        # Queue the sequence: content_block_stop -> content_block_start -> delta
+                        # The trigger chunk's delta is also emitted so that
+                        # text content arriving in the transition chunk is not lost.
+                        self.chunk_queue.append(
+                            {
+                                "type": "content_block_stop",
+                                "index": max(self.current_content_block_index - 1, 0),
+                            }
+                        )
+                        self.chunk_queue.append(
+                            {
+                                "type": "content_block_start",
+                                "index": self.current_content_block_index,
+                                "content_block": self.current_content_block_start,
+                            }
+                        )
+                        if self._has_meaningful_delta_content(processed_chunk):
+                            self.chunk_queue.append(processed_chunk)
+                        self.sent_content_block_finish = False
+                        return self.chunk_queue.popleft()
+
+                    if (
+                        processed_chunk["type"] == "message_delta"
+                        and self.sent_content_block_finish is False
+                    ):
+                        # Queue both the content_block_stop and the holding chunk
+                        self.chunk_queue.append(
+                            {
+                                "type": "content_block_stop",
+                                "index": self.current_content_block_index,
+                            }
+                        )
+                        self.sent_content_block_finish = True
+                        if (
+                            processed_chunk.get("delta", {}).get("stop_reason")
+                            is not None
+                        ):
+                            self.holding_stop_reason_chunk = processed_chunk
+                        else:
+                            self.chunk_queue.append(processed_chunk)
+                        return self.chunk_queue.popleft()
+                    elif self.holding_chunk is not None:
+                        self.chunk_queue.append(self.holding_chunk)
+                        self.chunk_queue.append(processed_chunk)
+                        self.holding_chunk = None
+                        return self.chunk_queue.popleft()
+                    else:
+                        self.chunk_queue.append(processed_chunk)
+                        return self.chunk_queue.popleft()
 
             # Handle any remaining held chunks after stream ends
-            if self.holding_chunk is not None:
-                self.chunk_queue.append(self.holding_chunk)
-                self.holding_chunk = None
+            if not self.queued_usage_chunk:
+                if self.holding_stop_reason_chunk is not None:
+                    self.chunk_queue.append(self.holding_stop_reason_chunk)
+                    self.holding_stop_reason_chunk = None
+
+                if self.holding_chunk is not None:
+                    self.chunk_queue.append(self.holding_chunk)
+                    self.holding_chunk = None
 
             if not self.sent_last_message:
                 self.sent_last_message = True
@@ -186,6 +268,10 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         except StopIteration:
             if self.chunk_queue:
                 return self.chunk_queue.popleft()
+            if self.holding_stop_reason_chunk is not None:
+                chunk = self.holding_stop_reason_chunk
+                self.holding_stop_reason_chunk = None
+                return chunk
             if self.sent_last_message is False:
                 self.sent_last_message = True
                 return {"type": "message_stop"}
@@ -194,7 +280,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             verbose_logger.error(
                 "Anthropic Adapter - {}\n{}".format(e, traceback.format_exc())
             )
-            raise StopAsyncIteration
+            raise StopIteration
 
     async def __anext__(self):  # noqa: PLR0915
         from .transformation import LiteLLMAnthropicMessagesAdapter
@@ -304,9 +390,9 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
                 if not self.queued_usage_chunk:
                     if should_start_new_block and not self.sent_content_block_finish:
-                        # Queue the sequence: content_block_stop -> content_block_start
-                        # The trigger chunk itself is not emitted as a delta since the
-                        # content_block_start already carries the relevant information.
+                        # Queue the sequence: content_block_stop -> content_block_start -> delta
+                        # The trigger chunk's delta is also emitted so that
+                        # text content arriving in the transition chunk is not lost.
 
                         # 1. Stop current content block
                         self.chunk_queue.append(
@@ -324,6 +410,10 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                                 "content_block": self.current_content_block_start,
                             }
                         )
+
+                        # 3. Emit the trigger chunk's delta if it carries content
+                        if self._has_meaningful_delta_content(processed_chunk):
+                            self.chunk_queue.append(processed_chunk)
 
                         # Reset state for new block
                         self.sent_content_block_finish = False
